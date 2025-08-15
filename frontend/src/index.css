@@ -1,0 +1,27 @@
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --text: #0f172a;
+  --border: #e6e6ef;
+  --accent: #6d5efc;
+  --accent-strong: #5447f2;
+  --accentA: rgba(109, 94, 252, 0.85);
+  --accent-contrast: #ffffff;
+  --ok: #22c55e;
+  --err: #ef4444;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
