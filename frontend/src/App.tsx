@@ -82,15 +82,11 @@ function App() {
       if (existing.length > 0) {
         p = existing[0]
         await ensurePageReady(p)
+        await ensureEdgelessStructure(p)
       } else {
         const desired = workspace.getPage('page0') || workspace.createPage({ id: 'page0' })
         await desired.load()
-        if (!hasRemoteUpdate && !desired.root) {
-          const pageBlockId = desired.addBlock('affine:page')
-          desired.addBlock('affine:surface', {}, pageBlockId)
-          const noteId = desired.addBlock('affine:note', {}, pageBlockId)
-          desired.addBlock('affine:paragraph', {}, noteId)
-        }
+        await ensureEdgelessStructure(desired)
         p = desired
       }
 
@@ -413,4 +409,17 @@ async function ensurePageReady(p: any) {
   } else {
     await p.load()
   }
+}
+
+async function ensureEdgelessStructure(p: any) {
+  await ensurePageReady(p)
+  if (p.root && p.getBlockByFlavour('affine:surface')?.[0]) return
+  const pageBlockId = p.root ? p.root.id : p.addBlock('affine:page')
+  const surface = p.getBlockByFlavour('affine:surface')?.[0]
+  const surfaceId = surface ? surface.id : p.addBlock('affine:surface', {}, pageBlockId)
+  if (!p.getBlockByFlavour('affine:note')?.length) {
+    const noteId = p.addBlock('affine:note', {}, pageBlockId)
+    p.addBlock('affine:paragraph', {}, noteId)
+  }
+  return surfaceId
 }
