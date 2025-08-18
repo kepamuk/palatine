@@ -1,11 +1,12 @@
-import { Routes, Route, Navigate } from 'react-router-dom'
-import { useAuth } from './hooks/useAuth'
-import Login from './components/Login'
-import Register from './components/Register'
-import EditorApp from './components/EditorApp'
-import ProtectedRoute from './components/ProtectedRoute'
+import { type ReactNode } from 'react'
+import { Navigate } from 'react-router-dom'
+import { useAuth } from '../hooks/useAuth'
 
-function App() {
+interface ProtectedRouteProps {
+  children: ReactNode
+}
+
+export default function ProtectedRoute({ children }: ProtectedRouteProps) {
   const { isAuthenticated, isLoading } = useAuth()
 
   if (isLoading) {
@@ -39,30 +40,15 @@ function App() {
               margin: '0 auto 16px',
             }}
           ></div>
-          Загрузка...
+          Проверка авторизации...
         </div>
       </div>
     )
   }
 
-  return (
-    <Routes>
-      <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
-      <Route
-        path="/register"
-        element={isAuthenticated ? <Navigate to="/" replace /> : <Register />}
-      />
-      <Route
-        path="/"
-        element={
-          <ProtectedRoute>
-            <EditorApp />
-          </ProtectedRoute>
-        }
-      />
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
-  )
-}
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />
+  }
 
-export default App
+  return <>{children}</>
+}

@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import './types'
 import express from 'express'
 import cors from 'cors'
 import { z } from 'zod'
@@ -8,6 +9,10 @@ import Redis from 'ioredis'
 import * as Y from 'yjs'
 import { Readable } from 'node:stream'
 import { createHash } from 'node:crypto'
+import bcrypt from 'bcryptjs'
+import jwt from 'jsonwebtoken'
+import session from 'express-session'
+import { v4 as uuidv4 } from 'uuid'
 
 async function fetchWithTimeout(
   url: string,
@@ -24,9 +29,28 @@ async function fetchWithTimeout(
 }
 
 const app = express()
-app.use(cors())
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true,
+  }),
+)
 app.use(express.json({ limit: '5mb' }))
-app.use(express.text({ limit: '5mb' })) // Добавляем обработку text/plain
+app.use(express.text({ limit: '5mb' }))
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'default-secret-change-in-production',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 24 * 60 * 60 * 1000,
+    },
+  }),
+)
+
+const JWT_SECRET = process.env.JWT_SECRET || 'default-jwt-secret-change-in-production'
 
 const { Pool } = pg
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
@@ -34,17 +58,50 @@ const db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) })
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379')
 
 async function ensureSchema() {
-  await sql`create table if not exists documents (
-    user_id text primary key,
-    ydoc bytea not null,
+  await sql`create table if not exists users (
+    id uuid primary key default gen_random_uuid(),
+    email text unique not null,
+    password_hash text not null,
+    display_name text,
+    created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
   )`.execute(db)
+
+  await sql`create table if not exists user_sessions (
+    id uuid primary key default gen_random_uuid(),
+    user_id uuid not null references users(id) on delete cascade,
+    token text unique not null,
+    expires_at timestamptz not null,
+    created_at timestamptz not null default now()
+  )`.execute(db)
+
+  await sql`create table if not exists documents (
+    id uuid primary key default gen_random_uuid(),
+    user_id uuid unique not null references users(id) on delete cascade,
+    ydoc bytea not null,
+    title text default 'Untitled Document',
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`.execute(db)
+
   await sql`create table if not exists blobs (
     key text primary key,
     content bytea not null,
     content_type text not null,
     updated_at timestamptz not null default now()
   )`.execute(db)
+
+  await sql`create index if not exists idx_user_sessions_token on user_sessions(token)`.execute(db)
+  await sql`create index if not exists idx_documents_user_id on documents(user_id)`.execute(db)
+  await sql`create index if not exists idx_user_sessions_expires_at on user_sessions(expires_at)`.execute(
+    db,
+  )
+
+  try {
+    await sql`alter table documents add constraint documents_user_id_unique unique (user_id)`.execute(
+      db,
+    )
+  } catch (e) {}
 }
 
 async function waitForDbReady(maxWaitMs = 30000) {
@@ -53,40 +110,231 @@ async function waitForDbReady(maxWaitMs = 30000) {
   while (true) {
     try {
       await sql`select 1`.execute(db)
-      console.log('[startup] БД готова')
       return
     } catch (e) {
       attempt++
       const elapsed = Date.now() - started
       if (elapsed > maxWaitMs) {
-        console.error('[startup] таймаут ожидания БД, прекращаем')
         throw e
       }
-      // DB not ready yet, retry
       await new Promise((r) => setTimeout(r, 1000))
     }
   }
 }
 
-app.post('/api/sync', async (req, res) => {
+async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, 12)
+}
+
+async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash)
+}
+
+function generateToken(): string {
+  return jwt.sign({ tokenId: uuidv4() }, JWT_SECRET, { expiresIn: '7d' })
+}
+
+async function authenticateUser(req: express.Request): Promise<{ userId: string } | null> {
+  const authHeader = req.headers.authorization
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null
+  }
+
+  const token = authHeader.substring(7)
+  try {
+    const session = await db
+      .selectFrom('user_sessions')
+      .select(['user_id'])
+      .where('token', '=', token)
+      .where('expires_at', '>', new Date())
+      .executeTakeFirst()
+
+    if (!session) {
+      return null
+    }
+
+    return { userId: session.user_id as string }
+  } catch (e) {
+    return null
+  }
+}
+
+async function requireAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  const auth = await authenticateUser(req)
+  if (!auth) {
+    return res.status(401).json({ error: 'Authentication required' })
+  }
+  req.user = auth
+  next()
+}
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const body = z
+      .object({
+        email: z.string().email(),
+        password: z.string().min(6),
+        displayName: z.string().optional(),
+      })
+      .parse(req.body)
+
+    const existingUser = await db
+      .selectFrom('users')
+      .select(['id'])
+      .where('email', '=', body.email.toLowerCase())
+      .executeTakeFirst()
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' })
+    }
+
+    const passwordHash = await hashPassword(body.password)
+    const user = await db
+      .insertInto('users')
+      .values({
+        email: body.email.toLowerCase(),
+        password_hash: passwordHash,
+        display_name: body.displayName || null,
+      })
+      .returning(['id', 'email', 'display_name'])
+      .executeTakeFirstOrThrow()
+
+    const token = generateToken()
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 дней
+
+    await db
+      .insertInto('user_sessions')
+      .values({
+        user_id: user.id as string,
+        token,
+        expires_at: expiresAt,
+      })
+      .execute()
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+      },
+      token,
+    })
+  } catch (e: any) {
+    if (e.name === 'ZodError') {
+      return res.status(400).json({ error: 'Invalid request data' })
+    }
+    res.status(500).json({ error: 'Registration failed' })
+  }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const body = z
+      .object({
+        email: z.string().email(),
+        password: z.string(),
+      })
+      .parse(req.body)
+
+    const user = await db
+      .selectFrom('users')
+      .select(['id', 'email', 'password_hash', 'display_name'])
+      .where('email', '=', body.email.toLowerCase())
+      .executeTakeFirst()
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' })
+    }
+
+    const isValidPassword = await verifyPassword(body.password, user.password_hash as string)
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' })
+    }
+
+    const token = generateToken()
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 дней
+
+    await db
+      .insertInto('user_sessions')
+      .values({
+        user_id: user.id as string,
+        token,
+        expires_at: expiresAt,
+      })
+      .execute()
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+      },
+      token,
+    })
+  } catch (e: any) {
+    if (e.name === 'ZodError') {
+      return res.status(400).json({ error: 'Invalid request data' })
+    }
+    res.status(500).json({ error: 'Login failed' })
+  }
+})
+
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.substring(7)
+      await db.deleteFrom('user_sessions').where('token', '=', token).execute()
+    }
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ error: 'Logout failed' })
+  }
+})
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const user = await db
+      .selectFrom('users')
+      .select(['id', 'email', 'display_name'])
+      .where('id', '=', req.user!.userId)
+      .executeTakeFirst()
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    res.json({
+      id: user.id,
+      email: user.email,
+      displayName: user.display_name,
+    })
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to get user info' })
+  }
+})
+
+app.post('/api/sync', requireAuth, async (req, res) => {
   const raw = typeof req.body === 'string' ? safeJson(req.body) : req.body
   if (!raw || typeof raw !== 'object')
     return res.status(400).json({ error: 'Invalid request body' })
-  const body = z.object({ userId: z.string(), update: z.array(z.number()) }).parse(raw)
-  const key = `ydoc:${body.userId}`
+  const body = z.object({ update: z.array(z.number()) }).parse(raw)
+  const key = `ydoc:${req.user!.userId}`
   const base64 = Buffer.from(Uint8Array.from(body.update)).toString('base64')
   await redis.rpush(key, base64)
   await redis.expire(key, 60 * 10)
   res.json({ ok: true })
 })
 
-app.post('/api/flush', async (req, res) => {
+app.post('/api/flush', requireAuth, async (req, res) => {
   let raw: any
   if (typeof req.body === 'string') {
-    // Если приходит как строка (content-type: text/plain)
     raw = safeJson(req.body)
   } else if (req.body && typeof req.body === 'object') {
-    // Если уже объект (content-type: application/json)
     raw = req.body
   } else {
     return res.status(400).json({ error: 'Invalid request body format' })
@@ -96,15 +344,13 @@ app.post('/api/flush', async (req, res) => {
 
   const body = z
     .object({
-      userId: z.string(),
       snapshot: z.array(z.number()).optional(),
       bundle: z.any().optional(),
     })
     .parse(raw)
-  const key = `ydoc:${body.userId}`
+  const key = `ydoc:${req.user!.userId}`
   let encoded: Buffer
 
-  // Приоритет snapshot (бинарные данные Y.js). Bundle — доп. мета
   if (body.snapshot && body.snapshot.length > 0) {
     encoded = Buffer.from(Uint8Array.from(body.snapshot))
   } else if (body.bundle) {
@@ -118,27 +364,36 @@ app.post('/api/flush', async (req, res) => {
     }
     encoded = Buffer.from(Y.encodeStateAsUpdate(doc))
   }
-  await db
-    .insertInto('documents')
-    .values({ user_id: body.userId, ydoc: encoded })
-    .onConflict((oc) => oc.column('user_id').doUpdateSet({ ydoc: encoded, updated_at: sql`now()` }))
-    .execute()
+
+  const existingDoc = await db
+    .selectFrom('documents')
+    .select(['id'])
+    .where('user_id', '=', req.user!.userId)
+    .executeTakeFirst()
+
+  if (existingDoc) {
+    await db
+      .updateTable('documents')
+      .set({ ydoc: encoded, updated_at: sql`now()` })
+      .where('id', '=', existingDoc.id as string)
+      .execute()
+  } else {
+    await db.insertInto('documents').values({ user_id: req.user!.userId, ydoc: encoded }).execute()
+  }
   await redis.del(key)
   res.json({ ok: true })
 })
 
-app.get('/api/load', async (req, res) => {
-  const userId = z.string().parse(req.query.userId)
+app.get('/api/load', requireAuth, async (req, res) => {
   const row = await db
     .selectFrom('documents')
     .selectAll()
-    .where('user_id', '=', userId)
+    .where('user_id', '=', req.user!.userId)
     .executeTakeFirst()
   if (!row) return res.json({ update: [] })
   const buf: Buffer = (row as any).ydoc
   res.setHeader('Cache-Control', 'no-store')
 
-  // Проверяем, это JSON bundle или бинарные данные
   if (buf.length > 0 && buf[0] === 0x7b) {
     try {
       const bundle = JSON.parse(buf.toString('utf8'))
@@ -146,7 +401,6 @@ app.get('/api/load', async (req, res) => {
     } catch {}
   }
 
-  // Возвращаем бинарные данные как update
   const bytes = new Uint8Array(buf)
   res.json({ update: Array.from(bytes) })
 })
@@ -201,7 +455,6 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 })
 
-// Приём и выдача постоянных blobs (для стабильного отображения изображений)
 app.post('/api/blob', express.raw({ type: '*/*', limit: '15mb' }), async (req, res) => {
   try {
     const buf: Buffer = Buffer.isBuffer(req.body)
