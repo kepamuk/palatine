@@ -6,6 +6,9 @@ import { Schema, Workspace, type Page } from '@blocksuite/store'
 import * as Y from 'yjs'
 import { AffineSchemas, __unstableSchemas } from '@blocksuite/blocks/models'
 import { useAuth } from '../hooks/useAuth'
+import { createRoot } from 'react-dom/client'
+import ImageGenerator from './ImageGenerator'
+import placeholderUrl from '../assets/test.jpg'
 
 type PersistedDoc = {
   workspaceId: string
@@ -20,10 +23,9 @@ type PersistedBundle = {
 
 function EditorApp() {
   const editorRef = useRef<EditorContainer | null>(null)
-  const [imagePrompt, setImagePrompt] = useState('')
   const [saving, setSaving] = useState<'idle' | 'saving' | 'ok' | 'err'>('idle')
-  const [generating, setGenerating] = useState<'idle' | 'pending' | 'ok' | 'err'>('idle')
   const { logout, user, token } = useAuth()
+  const [editorLoading, setEditorLoading] = useState(true)
 
   const schema = useMemo(() => {
     const s = new Schema()
@@ -45,6 +47,7 @@ function EditorApp() {
     if (bootedRef.current) return
     bootedRef.current = true
     const boot = async () => {
+      setEditorLoading(true)
       let hasRemoteUpdate = false
       try {
         const loadUrl = `${getApiBase()}/api/load`
@@ -204,9 +207,54 @@ function EditorApp() {
 
       await hydrateMissingBlobs(p)
       setPage(p)
+      setEditorLoading(false)
     }
     boot()
   }, [workspace, token])
+
+  useEffect(() => {
+    if (!page) return
+
+    let cancelled = false
+    let attempts = 0
+    const maxAttempts = 100
+
+    const mountIntoToolbar = () => {
+      if (cancelled) return
+      const toolbarEl = document.querySelector('edgeless-toolbar') as HTMLElement | null
+      if (!toolbarEl || !(toolbarEl as any).shadowRoot) {
+        scheduleNext()
+        return
+      }
+      const shadow = (toolbarEl as any).shadowRoot as ShadowRoot
+      const rightPart = shadow.querySelector('.edgeless-toolbar-right-part') as HTMLElement | null
+      const container =
+        rightPart || (shadow.querySelector('.edgeless-toolbar-container') as HTMLElement | null)
+      if (!container) {
+        scheduleNext()
+        return
+      }
+      if (!container.querySelector('#image-generator-container')) {
+        const host = document.createElement('div')
+        host.id = 'image-generator-container'
+        container.appendChild(host)
+        const root = createRoot(host)
+        root.render(<ImageGenerator page={page} apiPost={apiPost} />)
+      }
+    }
+
+    const scheduleNext = () => {
+      attempts += 1
+      if (attempts > maxAttempts) return
+      setTimeout(mountIntoToolbar, 200)
+    }
+
+    mountIntoToolbar()
+
+    return () => {
+      cancelled = true
+    }
+  }, [page])
 
   useEffect(() => {
     if (!page) return
@@ -466,28 +514,8 @@ function EditorApp() {
             Выйти
           </button>
         </div>
-        <input
-          placeholder="Опишите картинку"
-          value={imagePrompt}
-          onChange={(e) => setImagePrompt(e.target.value)}
-        />
-        <button
-          className={styles.primaryBtn}
-          onClick={handleGenerateImage}
-          disabled={generating === 'pending'}
-        >
-          Сгенерировать
-        </button>
+
         <div className={styles.statusBar}>
-          <div className={styles.badge} title="Генерация" data-state={generating}>
-            {generating === 'pending' ? (
-              <div className={styles.spinner} />
-            ) : generating === 'ok' ? (
-              <div className={styles.okDot} />
-            ) : generating === 'err' ? (
-              <div className={styles.errDot} />
-            ) : null}
-          </div>
           <div className={styles.badge} title="Синхронизация" data-state={saving}>
             {saving === 'saving' ? (
               <div className={styles.spinner} />
@@ -500,6 +528,45 @@ function EditorApp() {
         </div>
       </div>
       <div className={styles.editor} ref={mountEditor} />
+
+      {editorLoading && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 50,
+          }}
+        >
+          <div
+            style={{
+              background: '#fff',
+              padding: '28px 32px',
+              borderRadius: 16,
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.04)',
+              textAlign: 'center',
+              color: '#374151',
+              minWidth: 260,
+            }}
+          >
+            <div
+              style={{
+                width: 44,
+                height: 44,
+                border: '4px solid #e5e7eb',
+                borderTop: '4px solid #667eea',
+                borderRadius: '50%',
+                animation: 'spin 1s linear infinite',
+                margin: '0 auto 14px',
+              }}
+            />
+            Загрузка холста...
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -513,23 +580,25 @@ async function fakeGenerateImage(_prompt: string): Promise<string> {
 
 let imageCounter = 0
 
-async function insertImageBlock(page: any, src: string) {
-  const proxied = `${getApiBase()}/api/proxy-image?url=${encodeURIComponent(src)}`
-  const res = await fetch(proxied, { cache: 'no-store' })
-  if (!res.ok) throw new Error('image fetch failed')
-  const blob = await res.blob()
-  const upload = await fetch(`${getApiBase()}/api/blob`, {
-    method: 'POST',
-    headers: { 'Content-Type': blob.type || 'application/octet-stream' },
-    body: blob,
-  })
-  if (!upload.ok) throw new Error('blob upload failed')
-  const { key } = await upload.json()
+async function fetchProxyBlobWithFallback(src: string): Promise<Blob> {
+  try {
+    const proxied = `${getApiBase()}/api/proxy-image?url=${encodeURIComponent(src)}`
+    const res = await fetch(proxied, { cache: 'no-store' })
+    if (res.ok) {
+      const blob = await res.blob()
+      if (blob && blob.size > 1024) return blob
+    }
+  } catch {}
+  const phRes = await fetch(placeholderUrl)
+  return await phRes.blob()
+}
 
-  const stableUrl = `${getApiBase()}/api/blob/${encodeURIComponent(key)}`
-  const stableBlob = await fetch(stableUrl, { cache: 'no-store' }).then((r) => r.blob())
-  const blobKey = `blob:${key}`
-  const blobId = await page.blob.set(stableBlob, blobKey)
+async function insertImageBlock(page: any, src: string) {
+  const blob = await fetchProxyBlobWithFallback(src)
+
+  const localBlobKey = `blob:${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const blobId = await page.blob.set(blob, localBlobKey)
+
   const pageBlockId = page.root ? page.root.id : page.addBlock('affine:page')
   const surface = page.getBlockByFlavour('affine:surface')[0]
   const surfaceId = surface ? surface.id : page.addBlock('affine:surface', {}, pageBlockId)
@@ -543,7 +612,7 @@ async function insertImageBlock(page: any, src: string) {
     'affine:image',
     {
       sourceId: blobId,
-      caption: stableUrl,
+      caption: src,
       width: 300,
       height: 200,
       xywh: `[${x},${y},300,200]`,
@@ -584,13 +653,7 @@ async function hydrateMissingBlobs(page: any) {
       const url = img.caption as string | undefined
       if (!url) continue
       try {
-        const isStable = /\/api\/blob\//.test(url)
-        const targetUrl = isStable
-          ? url
-          : `${getApiBase()}/api/proxy-image?url=${encodeURIComponent(url)}`
-        const res = await fetch(targetUrl, { cache: 'no-store' })
-        if (!res.ok) continue
-        const blob = await res.blob()
+        const blob = await fetchProxyBlobWithFallback(url)
         await page.blob.set(blob, id)
       } catch {}
     }
