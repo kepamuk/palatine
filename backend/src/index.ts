@@ -350,11 +350,11 @@ app.post('/api/flush', requireAuth, async (req, res) => {
     .parse(raw)
   const key = `ydoc:${req.user!.userId}`
   let encoded: Buffer
-
-  if (body.snapshot && body.snapshot.length > 0) {
-    encoded = Buffer.from(Uint8Array.from(body.snapshot))
-  } else if (body.bundle) {
+  
+  if (body.bundle) {
     encoded = Buffer.from(JSON.stringify(body.bundle), 'utf8')
+  } else if (body.snapshot && body.snapshot.length > 0) {
+    encoded = Buffer.from(Uint8Array.from(body.snapshot))
   } else {
     const chunks = await redis.lrange(key, 0, -1)
     const doc = new Y.Doc()
@@ -390,31 +390,65 @@ app.get('/api/load', requireAuth, async (req, res) => {
     .selectAll()
     .where('user_id', '=', req.user!.userId)
     .executeTakeFirst()
-  if (!row) return res.json({ update: [] })
-  const buf: Buffer = (row as any).ydoc
+  
+  const key = `ydoc:${req.user!.userId}`
+  const chunks = await redis.lrange(key, 0, -1)
   res.setHeader('Cache-Control', 'no-store')
 
-  if (buf.length > 0 && buf[0] === 0x7b) {
+  if (!row && chunks.length === 0) {
+    return res.json({ update: [] })
+  }
+
+  let mergedDoc: Y.Doc | null = null
+
+  if (row) {
+    const buf: Buffer = (row as any).ydoc
+    if (buf && buf.length > 0 && buf[0] === 0x7b) {
+      try {
+        const bundle = JSON.parse(buf.toString('utf8'))
+        if (chunks.length === 0) {
+          return res.json({ bundle })
+        }
+      } catch {}
+    }
+    
     try {
-      const bundle = JSON.parse(buf.toString('utf8'))
-      return res.json({ bundle })
+      mergedDoc = new Y.Doc()
+      Y.applyUpdate(mergedDoc, new Uint8Array(buf))
+    } catch {
+      mergedDoc = null
+    }
+  }
+
+  if (!mergedDoc) mergedDoc = new Y.Doc()
+  
+  for (const chunk of chunks) {
+    try {
+      const buf = Buffer.from(chunk, 'base64')
+      Y.applyUpdate(mergedDoc, new Uint8Array(buf))
     } catch {}
   }
 
-  const bytes = new Uint8Array(buf)
-  res.json({ update: Array.from(bytes) })
+  const update = Y.encodeStateAsUpdate(mergedDoc)
+  return res.json({ update: Array.from(update) })
 })
 
 app.post('/api/gen-image', async (req, res) => {
   try {
     const parsed = z.object({ prompt: z.string().optional() }).safeParse(req.body)
     const prompt = parsed.success ? parsed.data.prompt : undefined
-    await new Promise((r) => setTimeout(r, 400))
-    const q = encodeURIComponent((prompt || 'nature').trim())
-    const url = `https://loremflickr.com/1200/800/${q}`
+    await new Promise((r) => setTimeout(r, 120))
+    const ts = Date.now()
+    const rand = Math.random().toString(36).slice(2)
+    const q = encodeURIComponent((prompt || '').trim())
+
+    const url = q
+      ? `https://loremflickr.com/1200/800/${q}?random=${ts}-${rand}`
+      : `https://picsum.photos/1200/800?random=${ts}-${rand}`
     res.json({ url })
   } catch (e) {
-    res.status(200).json({ url: `https://source.unsplash.com/1200x800/?nature` })
+    const ts = Date.now()
+    res.status(200).json({ url: `https://picsum.photos/1200/800?random=${ts}` })
   }
 })
 
@@ -424,11 +458,15 @@ app.get('/api/proxy-image', async (req, res) => {
     const url = Array.isArray(raw) ? raw[0] : (raw ?? '')
     if (typeof url !== 'string' || url.length === 0) return res.status(400).send('bad url')
     new URL(url)
-    const doStream = async (target: string) => {
+
+    const doStream = async (target: string, timeoutMs = 6500) => {
       const rsp = await fetchWithTimeout(
         target,
-        { redirect: 'follow', headers: { Accept: 'image/*', 'User-Agent': 'palatine-test/1.0' } },
-        3500,
+        {
+          redirect: 'follow',
+          headers: { Accept: 'image/*', 'User-Agent': 'palatine-test/1.0' },
+        },
+        timeoutMs,
       )
       if (!rsp.ok || !rsp.body) return false
       const ct = rsp.headers.get('content-type') || 'image/jpeg'
@@ -438,20 +476,28 @@ app.get('/api/proxy-image', async (req, res) => {
       Readable.fromWeb(rsp.body as any).pipe(res)
       return true
     }
-    const ok = await doStream(url as string)
+
+    let ok = await doStream(url as string, 6500)
+    if (!ok) ok = await doStream(`https://loremflickr.com/1200/800/${encodeURIComponent('nature')}?random=${Date.now()}`, 6000)
+    if (!ok) ok = await doStream(`https://picsum.photos/seed/${Date.now()}-${Math.random().toString(36).slice(2)}/1200/800`, 6000)
+    if (!ok) ok = await doStream(`https://picsum.photos/1200/800?random=${Date.now()}`, 6000)
     if (!ok) {
-      await doStream('https://picsum.photos/1200/800')
+      const previewJpeg = Buffer.from(
+        '/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBAQEA8QDw8QEA8PDw8QDxAQFREWFhUVFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OGhAQGi0lHyUtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAMgAwgMBIgACEQEDEQH/xAAaAAEAAwEBAQAAAAAAAAAAAAAAAQIDBAYF/8QAMhAAAQMDAgQFAwUAAAAAAAAAAQIDBAAFEQYSIRMxQVFhByIiMoGh0RMjQlKR/8QAGQEAAwEBAQAAAAAAAAAAAAAAAAECAwQF/8QAHREAAgMBAQEBAAAAAAAAAAAAAAECESEDEiIxQf/aAAwDAQACEQMRAD8A8Y7t2d3yq2aWJkq0eGU3QmE6kqvV5w8s5b5jYc7l2b7+Kqk9f0E3VbJtKx2x9q6b8Z5oYw2/0vZQhQq2hQCCOqKjV9lKq6p1lT3iJ5fUq3i7b2m8h8e7T3fQjJjI8aG2pZpO0kq1h9q0dB+R4mXo9g5uVxJfK8yX4X2zIY4w6W6j0gR1q3d1c0r0jY2h1qVY3Xo2cQpVQvK5K8HcYxWwzj+2bWlS19oZr3bVhJ3qHnJz7b6p8w6o0R7o0qY8o1B2k0rUuG0X0qKjQxVbVapV5s2lV2wG2hQFJwR4cQj3aFv8AR6m9k0W0H7bF2V8m1fFjv8ATbW8m+zYv3N2Txqg1oU8WlKq0q0g1Uq0o2xQqCkqgA8fJc8X0v2v1k7i4yccp2cGFnw+8y3c9y3nD1rZ2VtuF4p6t7mZk1x6i1WkqjSp1bEo2qjHIVUIWgHGa2Q8b7f3q1sX7b9r1QkoZcGvNQ9qbbY3i9p8kz9sH3u2Wk3UuP7lP7cC1TzU6VY1GqW1ahQqFQAKgAHk8fU9n+q7m3lL4cE6cnj9mZ3b8nC+Z9lR9n7Et0V7d3tPGh6lSqtKtKNakq1IVUCFoCCOMA0rH9b9i9l7mO5u3b4+X8f5P/9k=',
+        'base64',
+      )
+      res.setHeader('Content-Type', 'image/jpeg')
+      res.setHeader('Cache-Control', 'no-store')
+      return res.end(previewJpeg)
     }
   } catch (e) {
-    try {
-      const rsp = await fetchWithTimeout('https://picsum.photos/1200/800', {}, 3000)
-      const ct = rsp.headers.get('content-type') || 'image/jpeg'
-      res.setHeader('Content-Type', ct)
-      res.setHeader('Cache-Control', 'no-store')
-      Readable.fromWeb(rsp.body as any).pipe(res)
-    } catch {
-      res.status(502).send('bad upstream')
-    }
+    const previewJpeg = Buffer.from(
+      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBAQEA8QDw8QEA8PDw8QDxAQFREWFhUVFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OGhAQGi0lHyUtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAMgAwgMBIgACEQEDEQH/xAAaAAEAAwEBAQAAAAAAAAAAAAAAAQIDBAYF/8QAMhAAAQMDAgQFAwUAAAAAAAAAAQIDBAAFEQYSIRMxQVFhByIiMoGh0RMjQlKR/8QAGQEAAwEBAQAAAAAAAAAAAAAAAAECAwQF/8QAHREAAgMBAQEBAAAAAAAAAAAAAAECESEDEiIxQf/aAAwDAQACEQMRAD8A8Y7t2d3yq2aWJkq0eGU3QmE6kqvV5w8s5b5jYc7l2b7+Kqk9f0E3VbJtKx2x9q6b8Z5oYw2/0vZQhQq2hQCCOqKjV9lKq6p1lT3iJ5fUq3i7b2m8h8e7T3fQjJjI8aG2pZpO0kq1h9q0dB+R4mXo9g5uVxJfK8yX4X2zIY4w6W6j0gR1q3d1c0r0jY2h1qVY3Xo2cQpVQvK5K8HcYxWwzj+2bWlS19oZr3bVhJ3qHnJz7b6p8w6o0R7o0qY8o1B2k0rUuG0X0qKjQxVbVapV5s2lV2wG2hQFJwR4cQj3aFv8AR6m9k0W0H7bF2V8m1fFjv8ATbW8m+zYv3N2Txqg1oU8WlKq0q0g1Uq0o2xQqCkqgA8fJc8X0v2v1k7i4yccp2cGFnw+8y3c9y3nD1rZ2VtuF4p6t7mZk1x6i1WkqjSp1bEo2qjHIVUIWgHGa2Q8b7f3q1sX7b9r1QkoZcGvNQ9qbbY3i9p8kz9sH3u2Wk3UuP7lP7cC1TzU6VY1GqW1ahQqFQAKgAHk8fU9n+q7m3lL4cE6cnj9mZ3b8nC+Z9lR9n7Et0V7d3tPGh6lSqtKtKNakq1IVUCFoCCOMA0rH9b9i9l7mO5u3b4+X8f5P/9k=',
+      'base64',
+    )
+    res.setHeader('Content-Type', 'image/jpeg')
+    res.setHeader('Cache-Control', 'no-store')
+    return res.end(previewJpeg)
   }
 })
 

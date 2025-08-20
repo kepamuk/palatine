@@ -35,6 +35,11 @@ function EditorApp() {
   const [page, setPage] = useState<Page | null>(null)
   const saveTimer = useRef<number | null>(null)
   const bootedRef = useRef(false)
+  const hadRemoteRef = useRef(false)
+
+  const bcRef = useRef<BroadcastChannel | null>(null)
+  const suppressBroadcastRef = useRef(false)
+  const tabId = useMemo(() => `${Date.now()}-${Math.random().toString(36).slice(2)}`, [])
 
   useEffect(() => {
     if (bootedRef.current) return
@@ -69,6 +74,20 @@ function EditorApp() {
           await page.load()
           await ensurePageReady(page)
 
+          if (!page.root) {
+            try {
+              page.transact(() => {
+                try {
+                  const pageBlockId = page.addBlock('affine:page', {})
+                  page.addBlock('affine:surface', {}, pageBlockId)
+                } catch {}
+              })
+              await new Promise((r) => setTimeout(r, 40))
+              await page.load()
+              await ensurePageReady(page)
+            } catch {}
+          }
+
           hasRemoteUpdate = true
         } else {
           const b64 = localStorage.getItem('palatine:doc_b64')
@@ -95,6 +114,8 @@ function EditorApp() {
           }
         }
       } catch (e) {}
+
+      hadRemoteRef.current = hasRemoteUpdate
 
       let p: Page | null = null
       const existing = Array.from(workspace.pages.values())
@@ -200,6 +221,10 @@ function EditorApp() {
       }, 500) as unknown as number
 
       apiPost('/api/sync', { update: Array.from(update) }).catch(() => {})
+
+      if (!suppressBroadcastRef.current) {
+        postCrossTab({ type: 'update', update: Array.from(update), sender: tabId })
+      }
     }
     workspace.doc.on('update', onUpdate)
     const iv = window.setInterval(() => {
@@ -225,6 +250,62 @@ function EditorApp() {
       window.removeEventListener('beforeunload', onUnload)
     }
   }, [page, workspace, token])
+
+  useEffect(() => {
+    if (!workspace) return
+
+    const handleMessage = (msg: any) => {
+      if (!msg || msg.sender === tabId) return
+      if (msg.type === 'update' && Array.isArray(msg.update)) {
+        try {
+          suppressBroadcastRef.current = true
+          Y.applyUpdate(workspace.doc as unknown as Y.Doc, new Uint8Array(msg.update))
+        } finally {
+          suppressBroadcastRef.current = false
+        }
+      } else if (msg.type === 'request_full_snapshot') {
+        try {
+          const snapshot = Y.encodeStateAsUpdate(workspace.doc as unknown as Y.Doc)
+          postCrossTab({ type: 'full_snapshot', snapshot: Array.from(snapshot), sender: tabId })
+        } catch {}
+      } else if (msg.type === 'full_snapshot' && Array.isArray(msg.snapshot)) {
+        try {
+          suppressBroadcastRef.current = true
+          Y.applyUpdate(workspace.doc as unknown as Y.Doc, new Uint8Array(msg.snapshot))
+        } finally {
+          suppressBroadcastRef.current = false
+        }
+      }
+    }
+
+    let bc: BroadcastChannel | null = null
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      bc = new BroadcastChannel('palatine-doc')
+      bcRef.current = bc
+      bc.onmessage = (e: MessageEvent) => handleMessage(e.data)
+    }
+
+    const storageKey = 'palatine:bc'
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== storageKey || !e.newValue) return
+      try {
+        const msg = JSON.parse(e.newValue)
+        handleMessage(msg)
+      } catch {}
+    }
+    window.addEventListener('storage', onStorage)
+
+    setTimeout(() => {
+      if (!hadRemoteRef.current) {
+        postCrossTab({ type: 'request_full_snapshot', sender: tabId })
+      }
+    }, 200)
+
+    return () => {
+      if (bc) bc.close()
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [workspace, tabId])
 
   const mountEditor = useCallback(
     (node: HTMLDivElement | null) => {
@@ -355,6 +436,25 @@ function EditorApp() {
       keepalive: true,
       credentials: 'include',
     })
+  }
+
+  function postCrossTab(msg: any) {
+    const bc = bcRef.current
+    if (bc) {
+      try {
+        bc.postMessage(msg)
+        return
+      } catch {}
+    }
+    try {
+      const envelope = JSON.stringify({ ...msg, ts: Date.now() })
+      localStorage.setItem('palatine:bc', envelope)
+      setTimeout(() => {
+        try {
+          localStorage.removeItem('palatine:bc')
+        } catch {}
+      }, 50)
+    } catch {}
   }
 
   return (
